@@ -1193,9 +1193,6 @@ static void mstptimer_update(MSTP_INDEX mstp_index, PORT_ID port_number)
             SET_BIT(cport->modified_fields, MSTP_PORT_MEMBER_REM_TIME_BIT);
         }
     }
-    
-    mstp_flush(mstp_index, port_number);
-   
 }
 
 /*****************************************************************************/

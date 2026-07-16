@@ -249,6 +249,42 @@ int stp_pkt_tx_handler(uint32_t port_id, VLAN_ID vlan_id, char *buffer, uint16_t
     return ret;
 }
 
+/*
+ * stp_pkt_is_self_originated: returns true if the received STP frame was
+ * transmitted by this bridge (PF_PACKET loopback or same bridge source MAC).
+ */
+static bool stp_pkt_is_self_originated(const char *pkt, ssize_t packet_len,
+        unsigned char pkttype)
+{
+    MAC_ADDRESS *src_mac;
+
+    if (pkttype == PACKET_OUTGOING)
+        return true;
+
+    if (packet_len < (ssize_t)(L2_ETH_ADD_LEN * 2))
+        return false;
+
+    src_mac = (MAC_ADDRESS *)(pkt + L2_ETH_ADD_LEN);
+    return (stputil_compare_mac(src_mac, &g_stp_base_mac_addr) == EQUAL_TO);
+}
+
+/*
+ * Drop self-originated STP only on admin-edge ports. On non-edge ports a BPDU
+ * may legitimately return via a shared medium (e.g. hub) and must be processed
+ * for normal STP backup-port handling.
+ */
+static bool stp_pkt_drop_self_originated(PORT_ID port_number, const char *pkt,
+        ssize_t packet_len, unsigned char pkttype)
+{
+    if (!stp_pkt_is_self_originated(pkt, packet_len, pkttype))
+        return false;
+
+    if (STP_IS_PROTOCOL_ENABLED(L2_MSTP) &&
+        mstplib_port_is_admin_edge_port(port_number))
+        return true;
+
+    return false;
+}
 
 void stp_pkt_rx_handler (evutil_socket_t fd, short what, void *arg)
 {
@@ -350,6 +386,14 @@ void stp_pkt_rx_handler (evutil_socket_t fd, short what, void *arg)
             break;
         }
 	}
+
+    if (stp_pkt_drop_self_originated(intf_node->port_id, pkt, packet_len,
+                from.sll_pkttype))
+    {
+        STP_LOG_INFO("%s : Dropping self-originated STP packet on edge port",
+                intf_node->ifname);
+        return;
+    }
 
     //if PO-member port, assign intf_node to PO node.
     if (intf_node->master_ifindex)

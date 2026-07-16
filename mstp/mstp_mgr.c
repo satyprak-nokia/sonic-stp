@@ -42,9 +42,8 @@ static bool mstpmgr_init_mstp_bridge(UINT16 max_instances)
     mstp_bridge->txHoldCount = MSTP_DFLT_TXHOLDCOUNT;
     mstp_bridge->helloTime = MSTP_DFLT_HELLO_TIME;
 
-    // init mstConfigId
-    mstputil_get_default_name(mstp_bridge->mstConfigId.name,
-        sizeof(mstp_bridge->mstConfigId.name));
+    // init mstConfigId: shared empty region name when unset (all switches match)
+    memset(mstp_bridge->mstConfigId.name, 0, sizeof(mstp_bridge->mstConfigId.name));
     mstputil_compute_message_digest(false);
 
     PORT_MASK_SET_ALL(mstp_bridge->admin_pt2pt_mask);
@@ -62,7 +61,16 @@ static bool mstpmgr_init_mstp_bridge(UINT16 max_instances)
 
     cist_bridge->co.rootPortId = MSTP_INVALID_PORT;
     vlan_bmp_init(&cist_bridge->co.vlanmask);
-    bmp_alloc(&cist_bridge->co.portmask, g_max_stp_port);
+    if (cist_bridge->co.portmask)
+    {
+        bmp_free(cist_bridge->co.portmask);
+        cist_bridge->co.portmask = NULL;
+    }
+    if (bmp_alloc(&cist_bridge->co.portmask, g_max_stp_port) != 0)
+    {
+        STP_LOG_ERR("bmp_alloc failed for CIST portmask");
+        return false;
+    }
 
     cist_bridge->bridgePriority.root = cist_bridge->co.bridgeIdentifier;
     cist_bridge->bridgePriority.extPathCost = 0;
@@ -124,9 +132,15 @@ static void mstpmgr_init_debug()
     ret |= bmp_alloc(&debugGlobal.mstp.port_mask, g_max_stp_port);
     if (ret != 0)
     {
-        if(debugGlobal.mstp.instance_mask)
+        if (debugGlobal.mstp.instance_mask)
         {
             bmp_free(debugGlobal.mstp.instance_mask);
+            debugGlobal.mstp.instance_mask = NULL;
+        }
+        if (debugGlobal.mstp.port_mask)
+        {
+            bmp_free(debugGlobal.mstp.port_mask);
+            debugGlobal.mstp.port_mask = NULL;
         }
         STP_LOG_ERR("bmp_alloc Failed");
         return;
@@ -348,7 +362,18 @@ static bool mstpmgr_init_msti(MSTP_MSTID mstid)
 
     msti_bridge->co.rootPortId = MSTP_INVALID_PORT;
     vlan_bmp_init(&msti_bridge->co.vlanmask);
-    bmp_alloc(&msti_bridge->co.portmask, g_max_stp_port);
+    if (msti_bridge->co.portmask)
+    {
+        bmp_free(msti_bridge->co.portmask);
+        msti_bridge->co.portmask = NULL;
+    }
+    if (bmp_alloc(&msti_bridge->co.portmask, g_max_stp_port) != 0)
+    {
+        STP_LOG_ERR("[Mst %d] bmp_alloc failed for MSTI portmask", mstid);
+        MSTP_SET_INSTANCE_INDEX(mstp_bridge, mstid, MSTP_INDEX_INVALID);
+        g_mstp_global.free_instances++;
+        return false;
+    }
 
     msti_bridge->bridgePriority.designatedId =
         msti_bridge->bridgePriority.regionalRoot = msti_bridge->co.bridgeIdentifier;
@@ -1308,6 +1333,18 @@ static bool mstpmgr_config_name(UINT8 *name)
 }
 
 /*****************************************************************************/
+/* mstpmgr_config_default_region_name: apply shared empty region name when   */
+/* no region name is configured                                              */
+/*****************************************************************************/
+static void mstpmgr_config_default_region_name(void)
+{
+    UINT8 name[MSTP_NAME_LENGTH];
+
+    memset(name, 0, MSTP_NAME_LENGTH);
+    mstpmgr_config_name(name);
+}
+
+/*****************************************************************************/
 /* mstpmgr_config_revision_level: configure the revision level associated    */
 /* with the mst configuration identifier                                     */
 /*****************************************************************************/
@@ -1549,6 +1586,9 @@ static bool mstpmgr_config_port_admin_pt2pt(PORT_ID port_number, LINK_TYPE link_
     {
         mstp_port->operPt2PtMac = false;
     }
+
+    if (mstp_bridge->active)
+        mstpmgr_refresh_all();
 
     return true;
 }
@@ -2208,10 +2248,10 @@ void mstpmgr_process_intf_config_msg(void *msg)
     }
 
     STP_LOG_INFO("[CONFIG Port %s] op:%d, enable:%d, root_grd:%d, bpdu_grd:%d"
-            "do_dis:%d, cost:%d, pri:%d, edge:%d, count:%d",
+            "do_dis:%d, cost:%d, pri:%d, edge:%d, link_type:%d, count:%d",
             pmsg->intf_name, pmsg->opcode, pmsg->enabled, pmsg->root_guard, pmsg->bpdu_guard,
             pmsg->bpdu_guard_do_disable, pmsg->path_cost, pmsg->priority,
-            pmsg->edge, pmsg->count);
+            pmsg->edge, pmsg->link_type, pmsg->count);
 
 
     port_id = stp_intf_get_port_id_by_name(pmsg->intf_name);
@@ -2228,6 +2268,9 @@ void mstpmgr_process_intf_config_msg(void *msg)
     if (pmsg->opcode == STP_SET_COMMAND)
     {
         mstpmgr_config_port_disable(port_id, !pmsg->enabled);
+
+        mstpmgr_config_port_admin_edge(port_id, pmsg->edge);
+        mstpmgr_config_port_admin_pt2pt(port_id, (LINK_TYPE)pmsg->link_type);
 
         if (pmsg->priority == -1)
         {
@@ -2285,8 +2328,6 @@ void mstpmgr_process_intf_config_msg(void *msg)
         if (pmsg->enabled)
         {
             mstpmgr_add_control_port(port_id);
-
-            mstpmgr_config_port_admin_edge(port_id, pmsg->edge);
 
             mstpmgr_config_root_protect(port_id, pmsg->root_guard);
 
@@ -2496,8 +2537,7 @@ void mstpmgr_process_mstp_global_config_msg(void *msg)
         }
         else
         {
-            mstp_bridge = mstpdata_get_bridge();
-            mstputil_get_default_name(mstp_bridge->mstConfigId.name,sizeof(mstp_bridge->mstConfigId.name));
+            mstpmgr_config_default_region_name();
         }
 
         if(pmsg->revision_number)
@@ -2529,8 +2569,7 @@ void mstpmgr_process_mstp_global_config_msg(void *msg)
     {
         if(pmsg->name[0] == '\0')
         {
-            mstp_bridge = mstpdata_get_bridge();
-            mstputil_get_default_name(mstp_bridge->mstConfigId.name,sizeof(mstp_bridge->mstConfigId.name));
+            mstpmgr_config_default_region_name();
         }
 
         if(!pmsg->revision_number)
