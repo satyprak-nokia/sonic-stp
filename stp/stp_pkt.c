@@ -250,16 +250,11 @@ int stp_pkt_tx_handler(uint32_t port_id, VLAN_ID vlan_id, char *buffer, uint16_t
 }
 
 /*
- * stp_pkt_is_self_originated: returns true if the received STP frame was
- * transmitted by this bridge (PF_PACKET loopback or same bridge source MAC).
+ * stp_pkt_is_own_source_mac: true when Ethernet SA matches local bridge MAC.
  */
-static bool stp_pkt_is_self_originated(const char *pkt, ssize_t packet_len,
-        unsigned char pkttype)
+static bool stp_pkt_is_own_source_mac(const char *pkt, ssize_t packet_len)
 {
     MAC_ADDRESS *src_mac;
-
-    if (pkttype == PACKET_OUTGOING)
-        return true;
 
     if (packet_len < (ssize_t)(L2_ETH_ADD_LEN * 2))
         return false;
@@ -269,18 +264,20 @@ static bool stp_pkt_is_self_originated(const char *pkt, ssize_t packet_len,
 }
 
 /*
- * Drop self-originated STP only on admin-edge ports. On non-edge ports a BPDU
- * may legitimately return via a shared medium (e.g. hub) and must be processed
- * for normal STP backup-port handling.
+ * Drop PF_PACKET loopback of local TX on all ports (PACKET_OUTGOING). Hub/shared-
+ * medium own BPDUs arrive from wire as PACKET_HOST and must reach STP for backup
+ * role handling. On admin-edge ports also drop own source MAC if OUTGOING is not
+ * set by the platform.
  */
 static bool stp_pkt_drop_self_originated(PORT_ID port_number, const char *pkt,
         ssize_t packet_len, unsigned char pkttype)
 {
-    if (!stp_pkt_is_self_originated(pkt, packet_len, pkttype))
-        return false;
+    if (pkttype == PACKET_OUTGOING)
+        return true;
 
     if (STP_IS_PROTOCOL_ENABLED(L2_MSTP) &&
-        mstplib_port_is_admin_edge_port(port_number))
+        mstplib_port_is_admin_edge_port(port_number) &&
+        stp_pkt_is_own_source_mac(pkt, packet_len))
         return true;
 
     return false;
@@ -389,11 +386,7 @@ void stp_pkt_rx_handler (evutil_socket_t fd, short what, void *arg)
 
     if (stp_pkt_drop_self_originated(intf_node->port_id, pkt, packet_len,
                 from.sll_pkttype))
-    {
-        STP_LOG_INFO("%s : Dropping self-originated STP packet on edge port",
-                intf_node->ifname);
         return;
-    }
 
     //if PO-member port, assign intf_node to PO node.
     if (intf_node->master_ifindex)
